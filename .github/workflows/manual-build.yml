@@ -118,14 +118,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 多架构必备：QEMU + Buildx
+      # 多架构必备：QEMU
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: all
 
-      - uses: docker/setup-buildx-action@v3
+      # ✅ 修复 warning：不再使用 install:true（docker buildx install 已废弃）
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
         with:
-          install: true
+          driver: docker-container
+          use: true
 
       # 仅在 push=true 时登录（dry-run 不登录）
       - name: Login to DockerHub
@@ -178,26 +182,52 @@ jobs:
             echo "ERROR: inputs.platforms is empty"
             exit 1
           fi
-          # 简单校验：必须包含 linux/
           if ! echo "$p" | grep -q "linux/"; then
             echo "ERROR: inputs.platforms must be comma-separated like linux/amd64,linux/arm64/v8"
             exit 1
           fi
           echo "Platforms: $p"
 
-      - name: Build (and optionally push)
+      # push=false：更快（不生成 provenance/SBOM）
+      - name: Build (dry-run, no push)
+        if: ${{ inputs.push != 'true' }}
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-
-          # 关键：可选平台输入，默认 amd64 + arm64/v8
           platforms: ${{ inputs.platforms }}
-
-          push: ${{ inputs.push == 'true' }}
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
 
-          # 智能缓存：按 lang-version 独立 scope，命中率高且不互相污染
+          # ✅ 小升级：dry-run 不生成 attestations，减少开销与噪音
+          provenance: false
+
+          cache-from: type=gha,scope=${{ matrix.lang }}-${{ matrix.version }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.lang }}-${{ matrix.version }}
+
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
+            org.opencontainers.image.workflow=${{ github.workflow }}
+
+      # push=true：发布级（生成 provenance + SBOM）
+      - name: Build & push (release)
+        if: ${{ inputs.push == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+          # ✅ 小升级：发布时生成 provenance + SBOM（attestations）
+          provenance: true
+          sbom: true
+
           cache-from: type=gha,scope=${{ matrix.lang }}-${{ matrix.version }}
           cache-to: type=gha,mode=max,scope=${{ matrix.lang }}-${{ matrix.version }}
 
@@ -215,3 +245,8 @@ jobs:
           echo "Image     : ${{ steps.meta.outputs.image }}"
           echo "Tags      : ${{ steps.meta.outputs.tags }}"
           echo "Push      : ${{ inputs.push }}"
+          if [[ "${{ inputs.push }}" == "true" ]]; then
+            echo "Attest    : provenance=true, sbom=true"
+          else
+            echo "Attest    : provenance=false (dry-run)"
+          fi
