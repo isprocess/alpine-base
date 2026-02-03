@@ -34,7 +34,7 @@ on:
         default: "false"
 
       extra_tags:
-        description: "可选：额外 tag（逗号分隔），例如 rc,20260203"
+        description: "可选：额外 tag（逗号分隔），例如 rc,20260203（会以 <version>-<extra> 形式追加）"
         required: false
         default: ""
 
@@ -70,10 +70,12 @@ jobs:
           items=()
 
           while IFS= read -r line; do
-            t="$(echo "$line" | xargs)"   # trim
+            t="$(echo "$line" | xargs)"   # trim spaces
             [[ -z "$t" ]] && continue
 
-            # 允许输入 images/lang/version 或 images/lang/version/Dockerfile
+            # 允许输入：
+            # - images/<lang>/<version>
+            # - images/<lang>/<version>/Dockerfile
             if [[ "$t" == */Dockerfile ]]; then
               ctx="$(dirname "$t")"
               df="$t"
@@ -82,20 +84,21 @@ jobs:
               df="$t/Dockerfile"
             fi
 
+            # 强校验目录结构：images/<lang>/<version>
+            if [[ ! "$ctx" =~ ^images/[^/]+/[^/]+$ ]]; then
+              echo "ERROR: Invalid target path: $ctx (expected images/<lang>/<version>)"
+              exit 1
+            fi
+
             if [[ ! -f "$df" ]]; then
               echo "ERROR: Dockerfile not found: $df"
               exit 1
             fi
 
-            # 固定规则：images/<lang>/<version>
             lang="$(echo "$ctx" | awk -F/ '{print $2}')"
             ver="$(echo "$ctx"  | awk -F/ '{print $3}')"
 
-            if [[ -z "$lang" || -z "$ver" ]]; then
-              echo "ERROR: Unrecognized target path: $ctx (expected images/<lang>/<version>)"
-              exit 1
-            fi
-
+            # 生成矩阵项
             items+=("{\"lang\":\"$lang\",\"version\":\"$ver\",\"context\":\"$ctx\",\"dockerfile\":\"$df\"}")
           done <<< "$raw"
 
@@ -118,12 +121,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate platforms input
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${{ inputs.platforms }}"
+          p="$(echo "$p" | tr -d ' ')"
+          if [[ -z "$p" ]]; then
+            echo "ERROR: inputs.platforms is empty"
+            exit 1
+          fi
+          if ! echo "$p" | grep -q "^linux/"; then
+            echo "ERROR: inputs.platforms must look like linux/amd64,linux/arm64/v8"
+            exit 1
+          fi
+          echo "Platforms: $p"
+
       # 多架构必备：QEMU
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: all
 
-      # ✅ 修复 warning：不再使用 install:true（docker buildx install 已废弃）
+      # ✅ 修复 warning：不使用 install:true（docker buildx install 已废弃）
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
@@ -144,13 +163,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE="${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_PREFIX }}-${{ matrix.lang }}"
 
           tags=()
-          # 永远生成：<version>、<version>-<shortsha>
+          # ✅ 只要版本 tag（核心诉求）
           tags+=("${IMAGE}:${{ matrix.version }}")
-          tags+=("${IMAGE}:${{ matrix.version }}-${SHORT_SHA}")
 
           # 可选 latest
           if [[ "${{ inputs.tag_latest }}" == "true" ]]; then
@@ -170,23 +187,6 @@ jobs:
 
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
           echo "tags=$(IFS=,; echo "${tags[*]}")" >> $GITHUB_OUTPUT
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-
-      - name: Validate platforms input
-        shell: bash
-        run: |
-          set -euo pipefail
-          p="${{ inputs.platforms }}"
-          p="$(echo "$p" | tr -d ' ')"
-          if [[ -z "$p" ]]; then
-            echo "ERROR: inputs.platforms is empty"
-            exit 1
-          fi
-          if ! echo "$p" | grep -q "linux/"; then
-            echo "ERROR: inputs.platforms must be comma-separated like linux/amd64,linux/arm64/v8"
-            exit 1
-          fi
-          echo "Platforms: $p"
 
       # push=false：更快（不生成 provenance/SBOM）
       - name: Build (dry-run, no push)
@@ -200,9 +200,10 @@ jobs:
           push: false
           tags: ${{ steps.meta.outputs.tags }}
 
-          # ✅ 小升级：dry-run 不生成 attestations，减少开销与噪音
+          # dry-run 不生成 attestations
           provenance: false
 
+          # 智能缓存：按 lang-version 独立 scope
           cache-from: type=gha,scope=${{ matrix.lang }}-${{ matrix.version }}
           cache-to: type=gha,mode=max,scope=${{ matrix.lang }}-${{ matrix.version }}
 
@@ -224,7 +225,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
 
-          # ✅ 小升级：发布时生成 provenance + SBOM（attestations）
+          # 发布时生成 provenance + SBOM（attestations）
           provenance: true
           sbom: true
 
@@ -240,13 +241,13 @@ jobs:
       - name: Summary
         shell: bash
         run: |
-          echo "Targets   : ${{ matrix.context }}"
-          echo "Platforms : ${{ inputs.platforms }}"
-          echo "Image     : ${{ steps.meta.outputs.image }}"
-          echo "Tags      : ${{ steps.meta.outputs.tags }}"
-          echo "Push      : ${{ inputs.push }}"
+          echo "Target   : ${{ matrix.context }}"
+          echo "Platforms: ${{ inputs.platforms }}"
+          echo "Image    : ${{ steps.meta.outputs.image }}"
+          echo "Tags     : ${{ steps.meta.outputs.tags }}"
+          echo "Push     : ${{ inputs.push }}"
           if [[ "${{ inputs.push }}" == "true" ]]; then
-            echo "Attest    : provenance=true, sbom=true"
+            echo "Attest   : provenance=true, sbom=true"
           else
-            echo "Attest    : provenance=false (dry-run)"
+            echo "Attest   : provenance=false (dry-run)"
           fi
