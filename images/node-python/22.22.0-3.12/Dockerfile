@@ -1,117 +1,101 @@
-# 多阶段构建：Node.js 22.22 + Python 3.12 (Alpine 3.23)
+# syntax=docker/dockerfile:1
 
-# ============================================
-# Stage 1: Node.js 基础
-# ============================================
-FROM node:22.22.0-alpine3.23 AS node-builder
+# ------------------------------------------------------------
+# Sources
+# ------------------------------------------------------------
+FROM node:22.22.0-alpine3.23 AS node-src
+RUN printf "registry=http://mirrors.cloud.tencent.com/npm/\n" > /etc/npmrc
 
-ENV NODE_HOME=/usr/local
-ENV NPM_CONFIG_REGISTRY=http://mirrors.cloud.tencent.com/npm/
+FROM python:3.12.12-alpine3.23 AS py-src
+RUN mkdir -p /etc && \
+    printf "[global]\nindex-url = https://mirrors.tencent.com/pypi/simple\ntrusted-host = mirrors.tencent.com\n" > /etc/pip.conf
 
-# 配置 npm 腾讯云镜像
-RUN npm config set registry http://mirrors.cloud.tencent.com/npm/ && \
-    npm config get registry
 
-# 准备 Node.js 打包
-RUN mkdir -p /opt/node-export/usr/local/bin && \
-    mkdir -p /opt/node-export/usr/local/lib && \
-    mkdir -p /opt/node-export/usr/local/include && \
-    cp -r /usr/local/bin/node /opt/node-export/usr/local/bin/ && \
-    cp -r /usr/local/lib/node_modules /opt/node-export/usr/local/lib/ && \
-    ln -sf ../lib/node_modules/npm/bin/npm-cli.js /opt/node-export/usr/local/bin/npm && \
-    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /opt/node-export/usr/local/bin/npx
-
-# ============================================
-# Stage 2: Python 基础
-# ============================================
-FROM python:3.12.12-alpine3.23 AS python-builder
-
-ENV PYTHON_HOME=/usr/local
-ENV INSTALLDIR=/usr/local
-ENV PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple
-ENV PIP_TRUSTED_HOST=mirrors.tencent.com
-
-# 准备 Python 打包
-RUN mkdir -p /opt/python-export/usr/local/bin && \
-    mkdir -p /opt/python-export/usr/local/lib && \
-    mkdir -p /opt/python-export/usr/local/include && \
-    cp /usr/local/bin/python3.12 /opt/python-export/usr/local/bin/ && \
-    cp /usr/local/bin/pip3.12 /opt/python-export/usr/local/bin/ 2>/dev/null || cp /usr/local/bin/pip3 /opt/python-export/usr/local/bin/pip3.12 && \
-    cp -r /usr/local/lib/python3.12 /opt/python-export/usr/local/lib/ && \
-    cp /usr/local/lib/libpython3.12.so* /opt/python-export/usr/local/lib/ 2>/dev/null || true && \
-    cp -r /usr/local/include/python3.12 /opt/python-export/usr/local/include/ 2>/dev/null || true && \
-    ln -sf python3.12 /opt/python-export/usr/local/bin/python && \
-    ln -sf python3.12 /opt/python-export/usr/local/bin/python3 && \
-    ln -sf pip3.12 /opt/python-export/usr/local/bin/pip && \
-    ln -sf pip3.12 /opt/python-export/usr/local/bin/pip3
-
-# ============================================
-# Stage 3: 最终最小化镜像
-# ============================================
+# ------------------------------------------------------------
+# Final runtime
+# ------------------------------------------------------------
 FROM alpine:3.23
 
 LABEL maintainer="devops" \
-      description="Node.js 22.22 + Python 3.12 on Alpine 3.23 (Shanghai TZ, zh_CN)"
+      description="Node.js 22.22 + Python 3.12 on Alpine 3.23 (ultra slim)"
 
-# 时区和语言环境（必须保留 tzdata 才能正确识别夏令时等规则）
+ARG VERIFY=0
+
 ENV TZ=Asia/Shanghai \
     LANG=zh_CN.UTF-8 \
     LANGUAGE=zh_CN:zh \
     LC_ALL=zh_CN.UTF-8 \
-    NODE_HOME=/usr/local \
-    PYTHON_HOME=/usr/local \
     PATH="/usr/local/bin:${PATH}" \
+    NPM_CONFIG_REGISTRY=http://mirrors.cloud.tencent.com/npm/ \
     PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple \
-    PIP_TRUSTED_HOST=mirrors.tencent.com \
-    NPM_CONFIG_REGISTRY=http://mirrors.cloud.tencent.com/npm/
+    PIP_TRUSTED_HOST=mirrors.tencent.com
 
-# 安装运行时依赖（保留 tzdata 确保时区数据库完整）
-RUN apk add --no-cache \
+# ---- minimal deps only ----
+RUN set -eux; \
+    apk add --no-cache \
+        bash \
         tzdata \
+        ca-certificates \
         musl-locales \
         musl-locales-lang \
-        ca-certificates \
         libstdc++ \
-        libgcc \
-        bash \
-        curl \
-        coreutils \
-    && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
-    && echo ${TZ} > /etc/timezone
+        libgcc; \
+    \
+    cp /usr/share/zoneinfo/${TZ} /etc/localtime; \
+    echo ${TZ} > /etc/timezone; \
+    \
+    # now / ll (busybox based)
+    printf '#!/bin/sh\nexec date "+%%Y-%%m-%%d %%H:%%M:%%S %%z"\n' > /usr/local/bin/now; \
+    chmod +x /usr/local/bin/now; \
+    printf '#!/bin/sh\nexec ls -al "$@"\n' > /usr/local/bin/ll; \
+    chmod +x /usr/local/bin/ll
 
-# 复制 Node.js 和 Python
-COPY --from=node-builder /opt/node-export/usr/local /usr/local
-COPY --from=python-builder /opt/python-export/usr/local /usr/local
+# ---- Node ----
+COPY --from=node-src /etc/npmrc /etc/npmrc
+COPY --from=node-src /usr/local/bin/node /usr/local/bin/
+COPY --from=node-src /usr/local/bin/npm /usr/local/bin/
+COPY --from=node-src /usr/local/bin/npx /usr/local/bin/
+COPY --from=node-src /usr/local/bin/corepack /usr/local/bin/
+COPY --from=node-src /usr/local/lib/node_modules /usr/local/lib/node_modules
 
-# 添加实用工具脚本（now 和 ll）
-RUN echo -e '#!/bin/sh\ndate "+%Y-%m-%d %H:%M:%S %z"' > /usr/local/bin/now && \
-    chmod +x /usr/local/bin/now && \
-    echo -e '#!/bin/sh\nls --color=auto -alF' > /usr/local/bin/ll && \
-    chmod +x /usr/local/bin/ll && \
-    # 验证脚本
-    echo "=== Testing custom commands ===" && \
-    echo "Testing 'now':" && now && \
-    echo "Testing 'll':" && ll /usr/local/bin/ | head -5
+# ---- Python ----
+COPY --from=py-src /etc/pip.conf /etc/pip.conf
+COPY --from=py-src /usr/local/bin/python3.12 /usr/local/bin/
+COPY --from=py-src /usr/local/bin/pip3.12 /usr/local/bin/
+COPY --from=py-src /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=py-src /usr/local/lib/libpython3.12.so* /usr/local/lib/
 
-# 验证安装
-RUN echo "=== Environment Check ===" && \
-    echo "Node.js: $(node --version)" && \
-    echo "NPM: $(npm --version)" && \
-    echo "Python: $(python3 --version)" && \
-    echo "Pip: $(pip3 --version)" && \
-    echo "" && \
-    echo "=== Locale Check ===" && \
-    echo "LANG: $LANG" && \
-    echo "LC_ALL: $LC_ALL" && \
-    echo "" && \
-    echo "=== Timezone Check ===" && \
-    echo "TZ: $TZ" && \
-    echo "Date: $(date '+%Y-%m-%d %H:%M:%S %z')" && \
-    echo "" && \
-    echo "=== Mirror Config ===" && \
-    echo "NPM: $(npm config get registry)" && \
-    echo "PIP: $PIP_INDEX_URL"
+# ---- symlink + aggressive safe prune ----
+RUN set -eux; \
+    ln -sf python3.12 /usr/local/bin/python; \
+    ln -sf python3.12 /usr/local/bin/python3; \
+    ln -sf pip3.12 /usr/local/bin/pip; \
+    ln -sf pip3.12 /usr/local/bin/pip3; \
+    \
+    # Python cleanup
+    rm -rf /usr/local/lib/python3.12/test /usr/local/lib/python3.12/*/test || true; \
+    find /usr/local/lib/python3.12 -type d -name '__pycache__' -exec rm -rf '{}' +; \
+    find /usr/local/lib/python3.12 -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete; \
+    \
+    # npm cleanup
+    rm -rf /usr/local/lib/node_modules/npm/docs /usr/local/lib/node_modules/npm/man || true; \
+    \
+    # strip binaries
+    strip --strip-unneeded /usr/local/bin/node 2>/dev/null || true; \
+    strip --strip-unneeded /usr/local/lib/libpython3.12.so* 2>/dev/null || true
+
+# ---- optional verify ----
+RUN set -eux; \
+    if [ "$VERIFY" = "1" ]; then \
+      node -v; \
+      npm -v; \
+      python3 -V; \
+      pip3 -V; \
+      now; \
+      ll /usr/local/bin | head -5; \
+      echo "TZ=$TZ LANG=$LANG"; \
+      date '+%Y-%m-%d %H:%M:%S %z'; \
+    fi
 
 WORKDIR /app
-
 CMD ["bash"]
