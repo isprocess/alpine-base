@@ -1,0 +1,208 @@
+name: manual-build-multiarch
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: |
+          必填：构建目标目录（支持一个或多个，换行分隔）。
+          示例（单个）：images/python/3.12
+          示例（多个）：
+          images/java/17
+          images/node/20
+        required: true
+        default: "images/python/3.12"
+
+      push:
+        description: "是否推送到 DockerHub（true/false）"
+        required: true
+        default: "true"
+
+      profile:
+        description: "构建平台档位：fast（主流）/ full（全平台）"
+        required: true
+        default: "fast"
+
+      tag_latest:
+        description: "是否额外打 latest（true/false）"
+        required: true
+        default: "false"
+
+      extra_tags:
+        description: "可选：额外 tag（逗号分隔），例如 rc,20260203"
+        required: false
+        default: ""
+
+concurrency:
+  group: manual-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_PREFIX: ${{ github.event.repository.name }}
+
+jobs:
+  plan:
+    name: Plan matrix & platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      platforms: ${{ steps.platforms.outputs.platforms }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.profile }}" in
+            fast)
+              # 主流平台：更快更稳（建议日常使用）
+              echo "platforms=linux/amd64,linux/arm64/v8,linux/386,linux/arm/v7" >> $GITHUB_OUTPUT
+              ;;
+            full)
+              # 全平台：按你要求的完整清单
+              echo "platforms=linux/amd64,linux/arm64/v8,linux/386,linux/arm/v5,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "ERROR: inputs.profile must be 'fast' or 'full'"
+              exit 1
+              ;;
+          esac
+
+      - id: gen
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          raw="${{ inputs.targets }}"
+          raw="$(echo "$raw" | sed 's/\r//g')"
+
+          items=()
+
+          while IFS= read -r line; do
+            t="$(echo "$line" | xargs)"
+            [[ -z "$t" ]] && continue
+
+            if [[ "$t" == */Dockerfile ]]; then
+              ctx="$(dirname "$t")"
+              df="$t"
+            else
+              ctx="$t"
+              df="$t/Dockerfile"
+            fi
+
+            if [[ ! -f "$df" ]]; then
+              echo "ERROR: Dockerfile not found: $df"
+              exit 1
+            fi
+
+            # 固定规则：images/<lang>/<version>/Dockerfile
+            lang="$(echo "$ctx" | awk -F/ '{print $2}')"
+            ver="$(echo "$ctx"  | awk -F/ '{print $3}')"
+
+            if [[ -z "$lang" || -z "$ver" ]]; then
+              echo "ERROR: Unrecognized target path: $ctx (expected images/<lang>/<version>)"
+              exit 1
+            fi
+
+            items+=("{\"lang\":\"$lang\",\"version\":\"$ver\",\"context\":\"$ctx\",\"dockerfile\":\"$df\"}")
+          done <<< "$raw"
+
+          if [[ ${#items[@]} -eq 0 ]]; then
+            echo "ERROR: No valid targets provided."
+            exit 1
+          fi
+
+          json="{\"include\":[ $(IFS=,; echo "${items[*]}") ]}"
+          echo "matrix=$json" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build & optional push
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 多架构：启用 QEMU（全开更稳）
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Login to DockerHub
+        if: ${{ inputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_PREFIX }}-${{ matrix.lang }}"
+
+          tags=()
+          tags+=("${IMAGE}:${{ matrix.version }}")
+          tags+=("${IMAGE}:${{ matrix.version }}-${SHORT_SHA}")
+
+          if [[ "${{ inputs.tag_latest }}" == "true" ]]; then
+            tags+=("${IMAGE}:latest")
+          fi
+
+          extra="${{ inputs.extra_tags }}"
+          extra="$(echo "$extra" | sed 's/\r//g' | tr -d ' ')"
+          if [[ -n "$extra" ]]; then
+            IFS=',' read -ra arr <<< "$extra"
+            for x in "${arr[@]}"; do
+              [[ -z "$x" ]] && continue
+              tags+=("${IMAGE}:${{ matrix.version }}-$x")
+            done
+          fi
+
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tags=$(IFS=,; echo "${tags[*]}")" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Build (and optionally push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+
+          platforms: ${{ needs.plan.outputs.platforms }}
+
+          push: ${{ inputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+
+          # 智能缓存：按 lang-version 独立 scope，命中率高且不串味
+          cache-from: type=gha,scope=${{ matrix.lang }}-${{ matrix.version }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.lang }}-${{ matrix.version }}
+
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
+            org.opencontainers.image.workflow=${{ github.workflow }}
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Profile  : ${{ inputs.profile }}"
+          echo "Platforms: ${{ needs.plan.outputs.platforms }}"
+          echo "Target   : ${{ matrix.context }}"
+          echo "Image    : ${{ steps.meta.outputs.image }}"
+          echo "Tags     : ${{ steps.meta.outputs.tags }}"
+          echo "Push     : ${{ inputs.push }}"
