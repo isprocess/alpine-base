@@ -30,7 +30,6 @@ ARG ZULU_SHA256_ARM64=""
 RUN set -eux; \
     apk add --no-cache ca-certificates curl tar; \
     update-ca-certificates; \
-    \
     base="https://cdn.azul.com/zulu/bin"; \
     \
     # 1) Prefer BuildKit-provided arch
@@ -109,32 +108,26 @@ RUN set -eux; \
     echo "${TZ}" > /etc/timezone; \
     \
     # /usr/local/bin/now
-    cat > /usr/local/bin/now <<'EOF'; \
-#!/bin/sh
-date "+%Y-%m-%d %H:%M:%S %z"
-EOF
+    printf '%s\n' '#!/bin/sh' 'date "+%Y-%m-%d %H:%M:%S %z"' > /usr/local/bin/now; \
     chmod +x /usr/local/bin/now; \
     \
     # /usr/local/bin/ll
-    cat > /usr/local/bin/ll <<'EOF'; \
-#!/bin/sh
-ls -al "$@"
-EOF
+    printf '%s\n' '#!/bin/sh' 'ls -al "$@"' > /usr/local/bin/ll; \
     chmod +x /usr/local/bin/ll; \
     \
     # Default shell behavior: if bash installed -> bash, else -> sh
     # (Dockerfile can't conditionally switch CMD JSON array based on ARG reliably, so wrapper is smallest equivalent)
-    cat > /usr/local/bin/_default_shell <<'EOF'; \
-#!/bin/sh
-if command -v bash >/dev/null 2>&1; then exec bash; fi
-exec sh
-EOF
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if command -v bash >/dev/null 2>&1; then exec bash; fi' \
+      'exec sh' \
+      > /usr/local/bin/_default_shell; \
     chmod +x /usr/local/bin/_default_shell
 
 # Only allowed JRE copy from builder
 COPY --from=builder /opt/zulu /usr/local/zulu
 
-# Optional runtime verification (stdout only; no filesystem writes)
+# Optional runtime verification (stdout only; no filesystem writes beyond stdout)
 RUN set -eux; \
     if [ "${VERIFY}" = "1" ]; then \
       echo "TZ=${TZ}"; echo "LANG=${LANG}"; echo "LC_ALL=${LC_ALL}"; \
