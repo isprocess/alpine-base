@@ -1,18 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# -----------------------------------------------------------------------------
-# Alpine 3.23 + Azul Zulu JRE 8 (musl) - multi-arch (amd64/arm64), reproducible, slim
-#
-# Avoid pitfalls:
-# - Download tools only in builder stage: final image doesn't ship curl/wget/tar -> smaller + less attack surface.
-# - Prefer TARGETPLATFORM/TARGETARCH for deterministic multi-arch selection under buildx.
-# - Fallback to uname -m only when TARGET* is absent (plain docker build).
-# - Keep SHA256 ARGs for reproducibility + supply-chain integrity; empty => downgrade to HTTPS + fail-fast.
-# -----------------------------------------------------------------------------
-
 ARG ALPINE_VERSION=3.23
 
 # =========================
-# builder stage: fetch + verify + unpack (ONLY here we have curl/tar)
+# builder: download + verify + unpack (curl/tar only here)
 # =========================
 FROM alpine:${ALPINE_VERSION} AS builder
 
@@ -32,7 +22,7 @@ RUN set -eux; \
     update-ca-certificates; \
     base="https://cdn.azul.com/zulu/bin"; \
     \
-    # 1) Prefer BuildKit-provided arch
+    # 1) Prefer BuildKit-provided arch (buildx)
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
       case "${TARGETPLATFORM:-}" in \
@@ -56,12 +46,10 @@ RUN set -eux; \
       arm64) file="zulu${ZULU_JRE8_VERSION}-linux_musl_aarch64.tar.gz"; sha="${ZULU_SHA256_ARM64}" ;; \
       *) echo >&2 "ERROR: unsupported arch=${arch}"; exit 22 ;; \
     esac; \
-    \
     url="${base}/${file}"; \
     echo "Downloading: ${url}"; \
     curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 -o /tmp/zulu.tgz "${url}"; \
     \
-    # Integrity check: prefer sha256; if empty, downgrade (still fail-fast via curl -f)
     if [ -n "${sha}" ]; then \
       echo "${sha}  /tmp/zulu.tgz" | sha256sum -c -; \
     else \
@@ -73,17 +61,16 @@ RUN set -eux; \
     tar -xzf /tmp/zulu.tgz -C /opt/zulu --strip-components=1; \
     rm -f /tmp/zulu.tgz; \
     \
-    # Conservative slimming: remove non-runtime extras (keep core libs/security)
+    # Conservative slimming: remove non-runtime extras
     rm -rf /opt/zulu/demo /opt/zulu/sample /opt/zulu/man || true; \
     find /opt/zulu -maxdepth 4 -type f -name "*.zip" -print -delete || true; \
     \
-    # Optional build-time verification (stdout only)
     if [ "${VERIFY}" = "1" ]; then \
       /opt/zulu/bin/java -version; \
     fi
 
 # =========================
-# final stage: runtime only (strict allowlist)
+# final: runtime only (+ fontconfig)
 # =========================
 FROM alpine:${ALPINE_VERSION}
 
@@ -97,9 +84,16 @@ ENV TZ=Asia/Shanghai \
     JAVA_HOME=/usr/local/zulu \
     PATH=/usr/local/zulu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# final stage: single RUN for apk add + tz + scripts + default shell wrapper
+# final stage: single RUN for runtime pkgs + tz + scripts + fontconfig config + startup wrapper
 RUN set -eux; \
-    apk add --no-cache tzdata ca-certificates musl-locales musl-locales-lang libstdc++ libgcc; \
+    apk add --no-cache \
+      tzdata \
+      ca-certificates \
+      musl-locales \
+      musl-locales-lang \
+      libstdc++ \
+      libgcc \
+      fontconfig; \
     if [ "${INSTALL_BASH}" = "1" ]; then apk add --no-cache bash; fi; \
     update-ca-certificates; \
     \
@@ -107,18 +101,38 @@ RUN set -eux; \
     cp "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
     echo "${TZ}" > /etc/timezone; \
     \
-    # /usr/local/bin/now
+    # scripts: now / ll
     printf '%s\n' '#!/bin/sh' 'date "+%Y-%m-%d %H:%M:%S %z"' > /usr/local/bin/now; \
     chmod +x /usr/local/bin/now; \
-    \
-    # /usr/local/bin/ll
     printf '%s\n' '#!/bin/sh' 'ls -al "$@"' > /usr/local/bin/ll; \
     chmod +x /usr/local/bin/ll; \
     \
-    # Default shell behavior: if bash installed -> bash, else -> sh
-    # (Dockerfile can't conditionally switch CMD JSON array based on ARG reliably, so wrapper is smallest equivalent)
+    # Ensure fontconfig scans mounted font dirs reliably:
+    # - /fonts (common mount point)
+    # - /usr/share/fonts/custom (recommended mount point)
+    # Note: placing this under conf.d keeps it minimal and distro-aligned.
+    mkdir -p /etc/fonts/conf.d; \
+    printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">' \
+      '<fontconfig>' \
+      '  <dir>/fonts</dir>' \
+      '  <dir>/usr/share/fonts/custom</dir>' \
+      '</fontconfig>' \
+      > /etc/fonts/conf.d/99-local-fonts.conf; \
+    \
+    # Default shell wrapper:
+    # - refresh font cache if any font dir exists (runtime only)
+    # - exec bash if present, else sh
     printf '%s\n' \
       '#!/bin/sh' \
+      'set -e' \
+      '' \
+      '# If fonts are mounted, refresh cache for consistent rendering (runtime only).' \
+      'if [ -d /fonts ] || [ -d /usr/share/fonts/custom ] || [ -d /usr/share/fonts ] || [ -d /usr/local/share/fonts ]; then' \
+      '  fc-cache -f >/dev/null 2>&1 || true' \
+      'fi' \
+      '' \
       'if command -v bash >/dev/null 2>&1; then exec bash; fi' \
       'exec sh' \
       > /usr/local/bin/_default_shell; \
@@ -127,7 +141,7 @@ RUN set -eux; \
 # Only allowed JRE copy from builder
 COPY --from=builder /opt/zulu /usr/local/zulu
 
-# Optional runtime verification (stdout only; no filesystem writes beyond stdout)
+# Optional runtime verification (stdout only)
 RUN set -eux; \
     if [ "${VERIFY}" = "1" ]; then \
       echo "TZ=${TZ}"; echo "LANG=${LANG}"; echo "LC_ALL=${LC_ALL}"; \
@@ -135,6 +149,9 @@ RUN set -eux; \
       java -version; \
       /usr/local/bin/now; \
       /usr/local/bin/ll /; \
+      command -v fc-cache; \
+      # show fontconfig sees dirs (stdout only)
+      fc-list >/dev/null 2>&1 || true; \
     fi
 
 CMD ["/usr/local/bin/_default_shell"]
