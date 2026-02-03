@@ -6,6 +6,7 @@ on:
       targets:
         description: |
           必填：构建目标目录（支持一个或多个，换行分隔）。
+          规则：images/<lang>/<version>/Dockerfile
           示例（单个）：images/python/3.12
           示例（多个）：
           images/java/17
@@ -14,14 +15,18 @@ on:
         default: "images/python/3.12"
 
       push:
-        description: "是否推送到 DockerHub（true/false）"
+        description: "是否推送到 DockerHub（true/false）。dry-run 用 false"
         required: true
         default: "true"
 
-      profile:
-        description: "构建平台档位：fast（主流）/ full（全平台）"
-        required: true
-        default: "fast"
+      platforms:
+        description: |
+          构建架构（逗号分隔）。
+          默认：linux/amd64,linux/arm64/v8
+          全量示例：
+          linux/amd64,linux/arm64/v8,linux/386,linux/arm/v5,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x
+        required: false
+        default: "linux/amd64,linux/arm64/v8"
 
       tag_latest:
         description: "是否额外打 latest（true/false）"
@@ -41,37 +46,18 @@ permissions:
   contents: read
 
 env:
+  # 镜像命名：<dockerhub_namespace>/<repo>-<lang>
   DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
   IMAGE_PREFIX: ${{ github.event.repository.name }}
 
 jobs:
   plan:
-    name: Plan matrix & platforms
+    name: Plan build matrix from targets
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-      platforms: ${{ steps.platforms.outputs.platforms }}
     steps:
       - uses: actions/checkout@v4
-
-      - id: platforms
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ inputs.profile }}" in
-            fast)
-              # 主流平台：更快更稳（建议日常使用）
-              echo "platforms=linux/amd64,linux/arm64/v8,linux/386,linux/arm/v7" >> $GITHUB_OUTPUT
-              ;;
-            full)
-              # 全平台：按你要求的完整清单
-              echo "platforms=linux/amd64,linux/arm64/v8,linux/386,linux/arm/v5,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x" >> $GITHUB_OUTPUT
-              ;;
-            *)
-              echo "ERROR: inputs.profile must be 'fast' or 'full'"
-              exit 1
-              ;;
-          esac
 
       - id: gen
         shell: bash
@@ -84,9 +70,10 @@ jobs:
           items=()
 
           while IFS= read -r line; do
-            t="$(echo "$line" | xargs)"
+            t="$(echo "$line" | xargs)"   # trim
             [[ -z "$t" ]] && continue
 
+            # 允许输入 images/lang/version 或 images/lang/version/Dockerfile
             if [[ "$t" == */Dockerfile ]]; then
               ctx="$(dirname "$t")"
               df="$t"
@@ -100,7 +87,7 @@ jobs:
               exit 1
             fi
 
-            # 固定规则：images/<lang>/<version>/Dockerfile
+            # 固定规则：images/<lang>/<version>
             lang="$(echo "$ctx" | awk -F/ '{print $2}')"
             ver="$(echo "$ctx"  | awk -F/ '{print $3}')"
 
@@ -131,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 多架构：启用 QEMU（全开更稳）
+      # 多架构必备：QEMU + Buildx
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: all
@@ -140,6 +127,7 @@ jobs:
         with:
           install: true
 
+      # 仅在 push=true 时登录（dry-run 不登录）
       - name: Login to DockerHub
         if: ${{ inputs.push == 'true' }}
         uses: docker/login-action@v3
@@ -151,17 +139,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE="${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_PREFIX }}-${{ matrix.lang }}"
 
           tags=()
+          # 永远生成：<version>、<version>-<shortsha>
           tags+=("${IMAGE}:${{ matrix.version }}")
           tags+=("${IMAGE}:${{ matrix.version }}-${SHORT_SHA}")
 
+          # 可选 latest
           if [[ "${{ inputs.tag_latest }}" == "true" ]]; then
             tags+=("${IMAGE}:latest")
           fi
 
+          # 可选 extra tags（逗号分隔）：以 <version>-<extra> 的形式追加
           extra="${{ inputs.extra_tags }}"
           extra="$(echo "$extra" | sed 's/\r//g' | tr -d ' ')"
           if [[ -n "$extra" ]]; then
@@ -176,18 +168,36 @@ jobs:
           echo "tags=$(IFS=,; echo "${tags[*]}")" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
 
+      - name: Validate platforms input
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${{ inputs.platforms }}"
+          p="$(echo "$p" | tr -d ' ')"
+          if [[ -z "$p" ]]; then
+            echo "ERROR: inputs.platforms is empty"
+            exit 1
+          fi
+          # 简单校验：必须包含 linux/
+          if ! echo "$p" | grep -q "linux/"; then
+            echo "ERROR: inputs.platforms must be comma-separated like linux/amd64,linux/arm64/v8"
+            exit 1
+          fi
+          echo "Platforms: $p"
+
       - name: Build (and optionally push)
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
 
-          platforms: ${{ needs.plan.outputs.platforms }}
+          # 关键：可选平台输入，默认 amd64 + arm64/v8
+          platforms: ${{ inputs.platforms }}
 
           push: ${{ inputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
 
-          # 智能缓存：按 lang-version 独立 scope，命中率高且不串味
+          # 智能缓存：按 lang-version 独立 scope，命中率高且不互相污染
           cache-from: type=gha,scope=${{ matrix.lang }}-${{ matrix.version }}
           cache-to: type=gha,mode=max,scope=${{ matrix.lang }}-${{ matrix.version }}
 
@@ -200,9 +210,8 @@ jobs:
       - name: Summary
         shell: bash
         run: |
-          echo "Profile  : ${{ inputs.profile }}"
-          echo "Platforms: ${{ needs.plan.outputs.platforms }}"
-          echo "Target   : ${{ matrix.context }}"
-          echo "Image    : ${{ steps.meta.outputs.image }}"
-          echo "Tags     : ${{ steps.meta.outputs.tags }}"
-          echo "Push     : ${{ inputs.push }}"
+          echo "Targets   : ${{ matrix.context }}"
+          echo "Platforms : ${{ inputs.platforms }}"
+          echo "Image     : ${{ steps.meta.outputs.image }}"
+          echo "Tags      : ${{ steps.meta.outputs.tags }}"
+          echo "Push      : ${{ inputs.push }}"
