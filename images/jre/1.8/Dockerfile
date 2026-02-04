@@ -19,7 +19,7 @@ ARG VERIFY=0
 # Must be pinned, no "latest"
 ARG ZULU_JRE8_VERSION=8.92.0.21-ca-jre8.0.482
 
-# Keep sha256 ARG structure (fill these for strong reproducibility)
+# Keep sha256 ARG structure (fill for strong reproducibility)
 ARG ZULU_SHA256_AMD64=""
 ARG ZULU_SHA256_ARM64=""
 
@@ -52,6 +52,7 @@ RUN set -eux; \
       arm64) file="zulu${ZULU_JRE8_VERSION}-linux_musl_aarch64.tar.gz"; sha="${ZULU_SHA256_ARM64}" ;; \
       *) echo >&2 "ERROR: unsupported arch=${arch}"; exit 22 ;; \
     esac; \
+    \
     url="${base}/${file}"; \
     echo "Downloading: ${url}"; \
     curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 300 -o /tmp/zulu.tgz "${url}"; \
@@ -69,7 +70,7 @@ RUN set -eux; \
     \
     # Conservative slimming: remove non-runtime extras (reduce scan surface)
     rm -rf /opt/zulu/demo /opt/zulu/sample /opt/zulu/man || true; \
-    find /opt/zulu -maxdepth 4 -type f -name "*.zip" -print -delete || true; \
+    find /opt/zulu -maxdepth 6 -type f -name "*.zip" -print -delete || true; \
     \
     if [ "${VERIFY}" = "1" ]; then \
       /opt/zulu/bin/java -version; \
@@ -83,20 +84,13 @@ FROM ${ALPINE_IMAGE}
 ARG INSTALL_BASH=1
 ARG VERIFY=0
 
-# Web-service defaults (self-consistent): Min <= Initial <= Max
+# Web-service defaults (normal memory containers >=200MB):
+# - Initial/Max are used; MinRAMPercentage is only relevant for small memory containers (<200MB).
+ARG JAVA_INITIAL_RAM_PERCENT=50.0
 ARG JAVA_MAX_RAM_PERCENT=75.0
-ARG JAVA_INITIAL_RAM_PERCENT=25.0
-ARG JAVA_MIN_RAM_PERCENT=10.0
 
-# OCI labels (optional, scan/trace friendly). Override in build if desired.
-ARG IMAGE_TITLE="alpine-zulu8-web"
-ARG IMAGE_DESC="Alpine 3.23 + Azul Zulu JRE8 (musl) slim runtime (web defaults)"
-ARG IMAGE_SOURCE=""
-ARG IMAGE_REVISION=""
-LABEL org.opencontainers.image.title="${IMAGE_TITLE}" \
-      org.opencontainers.image.description="${IMAGE_DESC}" \
-      org.opencontainers.image.source="${IMAGE_SOURCE}" \
-      org.opencontainers.image.revision="${IMAGE_REVISION}"
+# Optional for small-memory containers (<200MB). Empty means "do not set".
+ARG JAVA_MIN_RAM_PERCENT=""
 
 ENV TZ=Asia/Shanghai \
     LANG=zh_CN.UTF-8 \
@@ -105,19 +99,22 @@ ENV TZ=Asia/Shanghai \
     JAVA_HOME=/usr/local/zulu \
     PATH=/usr/local/zulu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Zulu 8.92 (8u482) supports: UseContainerSupport, Max/Initial/MinRAMPercentage, ExitOnOutOfMemoryError
+# Base JVM options:
+# - Container aware (8u191+): UseContainerSupport
+# - OOM fast-exit: ExitOnOutOfMemoryError
+# - Web-service heap sizing: Initial/Max RAM%
+# - MinRAMPercentage is intentionally NOT set by default (only for <200MB containers).
 ENV JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -Djava.security.egd=file:/dev/urandom \
 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError \
--XX:MaxRAMPercentage=${JAVA_MAX_RAM_PERCENT} -XX:InitialRAMPercentage=${JAVA_INITIAL_RAM_PERCENT} -XX:MinRAMPercentage=${JAVA_MIN_RAM_PERCENT}"
+-XX:InitialRAMPercentage=${JAVA_INITIAL_RAM_PERCENT} -XX:MaxRAMPercentage=${JAVA_MAX_RAM_PERCENT}"
 
-# final stage: single RUN for runtime pkgs + tz + scripts + fontconfig config + non-root + wrapper + arg sanity checks
+# final stage: single RUN for runtime pkgs + tz + scripts + fontconfig config + non-root + wrapper + arg sanity checks (+ optional MinRAMPercentage)
 RUN set -eux; \
     \
-    # Sanity: prevent invalid RAM% combinations (Min must not exceed Max; Initial should be within range)
+    # Recommended sanity: Initial should not exceed Max (JVM will clamp, but keep config predictable)
     awk 'BEGIN{ \
-      min='${JAVA_MIN_RAM_PERCENT}'; init='${JAVA_INITIAL_RAM_PERCENT}'; max='${JAVA_MAX_RAM_PERCENT}'; \
-      if (min > max) exit 22; \
-      if (init < min || init > max) exit 23; \
+      init='${JAVA_INITIAL_RAM_PERCENT}'; max='${JAVA_MAX_RAM_PERCENT}'; \
+      if (init > max) exit 22; \
     }' >/dev/null; \
     \
     apk add --no-cache \
@@ -142,8 +139,6 @@ RUN set -eux; \
     chmod +x /usr/local/bin/ll; \
     \
     # Ensure fontconfig scans mounted font dirs reliably:
-    # - /fonts (common mount point)
-    # - /usr/share/fonts/custom (recommended mount point)
     mkdir -p /etc/fonts/conf.d; \
     printf '%s\n' \
       '<?xml version="1.0"?>' \
@@ -155,12 +150,20 @@ RUN set -eux; \
       > /etc/fonts/conf.d/99-local-fonts.conf; \
     \
     # Non-root runtime (scan-friendly + safer default):
-    # - Ensure writable dirs for fontconfig cache and tmp
     addgroup -S app; \
     adduser  -S -G app -h /app -s /sbin/nologin app; \
     mkdir -p /app /tmp /var/cache/fontconfig; \
     chown -R app:app /app /tmp /var/cache/fontconfig; \
     chmod 1777 /tmp; \
+    \
+    # Persist JAVA_TOOL_OPTIONS (+ optional MinRAMPercentage) for interactive shells.
+    # Note: MinRAMPercentage is only meaningful for very small memory containers (<200MB).
+    mkdir -p /etc/profile.d; \
+    if [ -n "${JAVA_MIN_RAM_PERCENT}" ]; then \
+      printf '%s\n' "export JAVA_TOOL_OPTIONS='${JAVA_TOOL_OPTIONS} -XX:MinRAMPercentage=${JAVA_MIN_RAM_PERCENT}'" > /etc/profile.d/java_tool_options.sh; \
+    else \
+      printf '%s\n' "export JAVA_TOOL_OPTIONS='${JAVA_TOOL_OPTIONS}'" > /etc/profile.d/java_tool_options.sh; \
+    fi; \
     \
     # Default shell wrapper:
     # - refresh font cache if any font dir exists (runtime only)
@@ -168,6 +171,9 @@ RUN set -eux; \
     printf '%s\n' \
       '#!/bin/sh' \
       'set -e' \
+      '' \
+      '# Source profile to apply persisted JAVA_TOOL_OPTIONS for interactive entry.' \
+      '[ -f /etc/profile.d/java_tool_options.sh ] && . /etc/profile.d/java_tool_options.sh || true' \
       '' \
       '# If fonts are mounted, refresh cache for consistent rendering (runtime only).' \
       'if [ -d /fonts ] || [ -d /usr/share/fonts/custom ] || [ -d /usr/share/fonts ] || [ -d /usr/local/share/fonts ]; then' \
@@ -191,6 +197,7 @@ RUN set -eux; \
     if [ "${VERIFY}" = "1" ]; then \
       echo "TZ=${TZ}"; echo "LANG=${LANG}"; echo "LC_ALL=${LC_ALL}"; \
       echo "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"; \
+      if [ -n "${JAVA_MIN_RAM_PERCENT}" ]; then echo "JAVA_MIN_RAM_PERCENT=${JAVA_MIN_RAM_PERCENT}"; fi; \
       date "+%Y-%m-%d %H:%M:%S %z"; \
       java -version; \
       /usr/local/bin/now; \
