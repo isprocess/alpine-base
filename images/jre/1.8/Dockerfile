@@ -1,10 +1,16 @@
 # syntax=docker/dockerfile:1.7
-ARG ALPINE_VERSION=3.23
+
+# -----------------------------------------------------------------------------
+# Reproducible base image:
+# - Default: alpine:3.23
+# - Pin digest by passing: --build-arg ALPINE_IMAGE=alpine:3.23@sha256:...
+# -----------------------------------------------------------------------------
+ARG ALPINE_IMAGE=alpine:3.23
 
 # =========================
 # builder: download + verify + unpack (curl/tar only here)
 # =========================
-FROM alpine:${ALPINE_VERSION} AS builder
+FROM ${ALPINE_IMAGE} AS builder
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
@@ -61,7 +67,7 @@ RUN set -eux; \
     tar -xzf /tmp/zulu.tgz -C /opt/zulu --strip-components=1; \
     rm -f /tmp/zulu.tgz; \
     \
-    # Conservative slimming: remove non-runtime extras
+    # Conservative slimming: remove non-runtime extras (reduce scan surface)
     rm -rf /opt/zulu/demo /opt/zulu/sample /opt/zulu/man || true; \
     find /opt/zulu -maxdepth 4 -type f -name "*.zip" -print -delete || true; \
     \
@@ -70,12 +76,27 @@ RUN set -eux; \
     fi
 
 # =========================
-# final: runtime only (+ fontconfig)
+# final: runtime only (+ fontconfig, non-root, scan-friendly, web-default JVM tuning)
 # =========================
-FROM alpine:${ALPINE_VERSION}
+FROM ${ALPINE_IMAGE}
 
 ARG INSTALL_BASH=1
 ARG VERIFY=0
+
+# Web-service defaults (self-consistent): Min <= Initial <= Max
+ARG JAVA_MAX_RAM_PERCENT=75.0
+ARG JAVA_INITIAL_RAM_PERCENT=25.0
+ARG JAVA_MIN_RAM_PERCENT=10.0
+
+# OCI labels (optional, scan/trace friendly). Override in build if desired.
+ARG IMAGE_TITLE="alpine-zulu8-web"
+ARG IMAGE_DESC="Alpine 3.23 + Azul Zulu JRE8 (musl) slim runtime (web defaults)"
+ARG IMAGE_SOURCE=""
+ARG IMAGE_REVISION=""
+LABEL org.opencontainers.image.title="${IMAGE_TITLE}" \
+      org.opencontainers.image.description="${IMAGE_DESC}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
 
 ENV TZ=Asia/Shanghai \
     LANG=zh_CN.UTF-8 \
@@ -84,8 +105,21 @@ ENV TZ=Asia/Shanghai \
     JAVA_HOME=/usr/local/zulu \
     PATH=/usr/local/zulu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# final stage: single RUN for runtime pkgs + tz + scripts + fontconfig config + startup wrapper
+# Zulu 8.92 (8u482) supports: UseContainerSupport, Max/Initial/MinRAMPercentage, ExitOnOutOfMemoryError
+ENV JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -Djava.security.egd=file:/dev/urandom \
+-XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError \
+-XX:MaxRAMPercentage=${JAVA_MAX_RAM_PERCENT} -XX:InitialRAMPercentage=${JAVA_INITIAL_RAM_PERCENT} -XX:MinRAMPercentage=${JAVA_MIN_RAM_PERCENT}"
+
+# final stage: single RUN for runtime pkgs + tz + scripts + fontconfig config + non-root + wrapper + arg sanity checks
 RUN set -eux; \
+    \
+    # Sanity: prevent invalid RAM% combinations (Min must not exceed Max; Initial should be within range)
+    awk 'BEGIN{ \
+      min='${JAVA_MIN_RAM_PERCENT}'; init='${JAVA_INITIAL_RAM_PERCENT}'; max='${JAVA_MAX_RAM_PERCENT}'; \
+      if (min > max) exit 22; \
+      if (init < min || init > max) exit 23; \
+    }' >/dev/null; \
+    \
     apk add --no-cache \
       tzdata \
       ca-certificates \
@@ -101,7 +135,7 @@ RUN set -eux; \
     cp "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
     echo "${TZ}" > /etc/timezone; \
     \
-    # scripts: now / ll
+    # scripts: now / ll (busybox-compatible)
     printf '%s\n' '#!/bin/sh' 'date "+%Y-%m-%d %H:%M:%S %z"' > /usr/local/bin/now; \
     chmod +x /usr/local/bin/now; \
     printf '%s\n' '#!/bin/sh' 'ls -al "$@"' > /usr/local/bin/ll; \
@@ -110,7 +144,6 @@ RUN set -eux; \
     # Ensure fontconfig scans mounted font dirs reliably:
     # - /fonts (common mount point)
     # - /usr/share/fonts/custom (recommended mount point)
-    # Note: placing this under conf.d keeps it minimal and distro-aligned.
     mkdir -p /etc/fonts/conf.d; \
     printf '%s\n' \
       '<?xml version="1.0"?>' \
@@ -120,6 +153,14 @@ RUN set -eux; \
       '  <dir>/usr/share/fonts/custom</dir>' \
       '</fontconfig>' \
       > /etc/fonts/conf.d/99-local-fonts.conf; \
+    \
+    # Non-root runtime (scan-friendly + safer default):
+    # - Ensure writable dirs for fontconfig cache and tmp
+    addgroup -S app; \
+    adduser  -S -G app -h /app -s /sbin/nologin app; \
+    mkdir -p /app /tmp /var/cache/fontconfig; \
+    chown -R app:app /app /tmp /var/cache/fontconfig; \
+    chmod 1777 /tmp; \
     \
     # Default shell wrapper:
     # - refresh font cache if any font dir exists (runtime only)
@@ -141,16 +182,20 @@ RUN set -eux; \
 # Only allowed JRE copy from builder
 COPY --from=builder /opt/zulu /usr/local/zulu
 
+# Drop privileges by default
+USER app
+WORKDIR /app
+
 # Optional runtime verification (stdout only)
 RUN set -eux; \
     if [ "${VERIFY}" = "1" ]; then \
       echo "TZ=${TZ}"; echo "LANG=${LANG}"; echo "LC_ALL=${LC_ALL}"; \
+      echo "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"; \
       date "+%Y-%m-%d %H:%M:%S %z"; \
       java -version; \
       /usr/local/bin/now; \
       /usr/local/bin/ll /; \
       command -v fc-cache; \
-      # show fontconfig sees dirs (stdout only)
       fc-list >/dev/null 2>&1 || true; \
     fi
 
